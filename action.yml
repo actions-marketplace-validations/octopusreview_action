@@ -1,0 +1,38 @@
+name: "Octopus Review"
+description: "AI-powered context-aware code review for pull requests. Zero config for open source."
+author: "Octopus Review"
+
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  octopus-api-key:
+    description: "Octopus API key (oct_*). Required for private repos. Optional for public repos (free community tier)."
+    required: false
+  github-token:
+    description: "GitHub token for repo access and posting reviews."
+    required: false
+    default: ${{ github.token }}
+  api-url:
+    description: "Octopus API base URL."
+    required: false
+    default: "https://octopus-review.ai"
+  force-reindex:
+    description: "Force re-index the repository before reviewing."
+    required: false
+    default: "false"
+  reindex-threshold-hours:
+    description: "Re-index if last index is older than this many hours."
+    required: false
+    default: "24"
+
+outputs:
+  findings-count:
+    description: "Total number of findings in the review."
+  summary:
+    description: "Review summary text."
+
+runs:
+  using: "node20"
+  main: "dist/index.js"

@@ -1,0 +1,6 @@
+node_modules/
+*.js.map
+licenses.txt
+
+# Don't ignore dist/ — it must be committed for GitHub Actions
+# !dist/
