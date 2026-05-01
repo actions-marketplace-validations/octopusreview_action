@@ -21,7 +21,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: octopusreview/octopus-action@v1
+      - uses: octopusreview/action@v1
 ```
 
 That's it. No account, no API key, no configuration. Your repo will be indexed on the first run and reviewed with full codebase context.
@@ -48,7 +48,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: octopusreview/octopus-action@v1
+      - uses: octopusreview/action@v1
         with:
           octopus-api-key: ${{ secrets.OCTOPUS_API_KEY }}
 ```
@@ -125,7 +125,7 @@ on:
 
 ```yaml
 steps:
-  - uses: octopusreview/octopus-action@v1
+  - uses: octopusreview/action@v1
     id: review
     with:
       octopus-api-key: ${{ secrets.OCTOPUS_API_KEY }}
@@ -152,4 +152,4 @@ With an API key, you can customize severity thresholds, disable specific finding
 
 - [Octopus Review](https://octopus-review.ai) — Dashboard, settings, and analytics
 - [Documentation](https://octopus-review.ai/docs) — Full docs
-- [Issues](https://github.com/octopusreview/octopus-action/issues) — Bug reports and feature requests
+- [Issues](https://github.com/octopusreview/action/issues) — Bug reports and feature requests
