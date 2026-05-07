@@ -92,26 +92,17 @@ export async function postReview(params: {
   repo: string;
   prNumber: number;
   findings: Finding[];
-  summary: string;
   diff: string;
-  community: boolean;
-  firstCommunityReview: boolean;
 }): Promise<{ posted: number; skipped: number }> {
   const octokit = github.getOctokit(params.token);
   const diffLines = parseDiffLines(params.diff);
   const comments = buildInlineComments(params.findings, diffLines);
 
-  // Build review body
-  let reviewBody = params.summary;
-
-  if (params.community && params.firstCommunityReview) {
-    reviewBody +=
-      "\n\n---\n*This review ran without an Octopus API key. " +
-      "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
-      "[Learn more](https://octopus-review.ai/docs/github-action)*";
-  }
-
-  reviewBody += "\n\n---\n*Reviewed by [Octopus](https://octopus-review.ai)*";
+  // The full summary lives in a separate find-or-update issue comment so it
+  // doesn't accumulate across commits. The review body here is a short pointer.
+  const reviewBody =
+    `🐙 **Octopus** posted ${params.findings.length} inline finding${params.findings.length === 1 ? "" : "s"}. ` +
+    `See the pinned Octopus summary comment for the full review.`;
 
   // Post the review — retry without offending comments on 422
   let commentsToPost = comments;

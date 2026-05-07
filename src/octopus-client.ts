@@ -14,7 +14,8 @@ export interface Finding {
   confidence: string;
 }
 
-export interface ReviewResponse {
+export interface ReviewResponseCompleted {
+  status: "completed";
   findings: Finding[];
   summary: string;
   model: string;
@@ -26,6 +27,16 @@ export interface ReviewResponse {
     outputTokens: number;
   };
 }
+
+export interface ReviewResponseQueued {
+  status: "queued";
+  jobId: string;
+  existing: boolean;
+  community: true;
+  message: string;
+}
+
+export type InitialReviewResponse = ReviewResponseCompleted | ReviewResponseQueued;
 
 export interface ReviewRequest {
   owner: string;
@@ -45,7 +56,7 @@ export async function requestReview(
   apiUrl: string,
   apiKey: string | undefined,
   params: ReviewRequest,
-): Promise<ReviewResponse> {
+): Promise<InitialReviewResponse> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
@@ -66,7 +77,57 @@ export async function requestReview(
     throw new OctopusApiError(message, res.status);
   }
 
-  return res.json() as Promise<ReviewResponse>;
+  return res.json() as Promise<InitialReviewResponse>;
+}
+
+export interface PollResponseInFlight {
+  status: "indexing" | "reviewing";
+  jobId: string;
+  startedAt?: string | null;
+  attempts?: number;
+}
+
+export interface PollResponseFailed {
+  status: "failed";
+  jobId: string;
+  error: string;
+}
+
+export interface PollResponseExpired {
+  status: "expired";
+  error: string;
+}
+
+export type PollResponse =
+  | ReviewResponseCompleted
+  | PollResponseInFlight
+  | PollResponseFailed
+  | PollResponseExpired;
+
+export async function pollReview(
+  apiUrl: string,
+  jobId: string,
+  repoFullName: string,
+): Promise<PollResponse> {
+  const url = `${apiUrl}/api/github-action/review/${encodeURIComponent(jobId)}?repo=${encodeURIComponent(repoFullName)}`;
+  const res = await fetch(url, { method: "GET" });
+
+  if (res.status === 404) {
+    throw new OctopusApiError("Job not found", 404);
+  }
+  if (res.status === 403) {
+    throw new OctopusApiError("Repo mismatch on poll", 403);
+  }
+  if (res.status === 410) {
+    return { status: "expired", error: "Job expired" };
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: "Unknown error" }));
+    const message = (body as { error?: string }).error ?? `HTTP ${res.status}`;
+    throw new OctopusApiError(message, res.status);
+  }
+
+  return res.json() as Promise<PollResponse>;
 }
 
 export class OctopusApiError extends Error {

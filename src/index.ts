@@ -1,9 +1,12 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { requestReview, OctopusApiError } from "./octopus-client";
+import { requestReview, pollReview, OctopusApiError, type ReviewResponseCompleted } from "./octopus-client";
 import { postReview } from "./post-review";
+import { postOrUpdateSummaryComment } from "./summary-comment";
 
 const MAX_DIFF_SIZE = 500_000; // 500KB
+const POLL_INTERVAL_MS = 10_000; // 10s
+const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 
 async function run(): Promise<void> {
   try {
@@ -76,7 +79,7 @@ async function run(): Promise<void> {
     // ── Call Octopus API ──────────────────────────────────────────────────
 
     core.info("Sending to Octopus for review...");
-    const result = await requestReview(apiUrl, apiKey, {
+    const initial = await requestReview(apiUrl, apiKey, {
       owner,
       repo,
       prNumber,
@@ -90,6 +93,76 @@ async function run(): Promise<void> {
       reindexThresholdHours,
     });
 
+    let result: ReviewResponseCompleted;
+
+    if (initial.status === "queued") {
+      core.info(
+        `Repository indexing in background (jobId=${initial.jobId}${initial.existing ? ", existing job" : ""}). Polling for result...`,
+      );
+
+      // Show progress in the (single) Octopus summary comment — find-or-create.
+      try {
+        await postOrUpdateSummaryComment({
+          octokit,
+          owner,
+          repo,
+          prNumber,
+          body:
+            "> 🐙 **Octopus Review** — Repository hasn't been indexed yet.\n>\n" +
+            "> Indexing in progress... will update this comment with the review when ready.",
+        });
+      } catch (err) {
+        core.warning(
+          `Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      const repoFullName = `${owner}/${repo}`;
+      const polled = await pollUntilDone(apiUrl, initial.jobId, repoFullName);
+
+      if (polled.kind === "timeout") {
+        core.warning(
+          `Polling timed out after ${POLL_TIMEOUT_MS / 1000}s — indexing is still running on the server. ` +
+            `The review will be posted on the next push or workflow run once indexing completes.`,
+        );
+        await postOrUpdateSummaryComment({
+          octokit,
+          owner,
+          repo,
+          prNumber,
+          body:
+            "> 🐙 **Octopus Review** — Indexing is taking longer than expected.\n>\n" +
+            "> Re-run this workflow (or push a new commit) once indexing finishes to get the review.",
+        }).catch((err) =>
+          core.warning(`Failed to update placeholder: ${err instanceof Error ? err.message : String(err)}`),
+        );
+        core.setOutput("findings-count", "0");
+        core.setOutput("summary", "Indexing in progress; review pending.");
+        return;
+      }
+
+      if (polled.kind === "failed") {
+        core.setFailed(`Octopus review failed: ${polled.error}`);
+        await postOrUpdateSummaryComment({
+          octokit,
+          owner,
+          repo,
+          prNumber,
+          body: `> 🐙 **Octopus Review** — Review failed: ${polled.error}`,
+        }).catch(() => {});
+        return;
+      }
+
+      if (polled.kind === "expired") {
+        core.warning("Octopus review job expired before completion.");
+        return;
+      }
+
+      result = polled.result;
+    } else {
+      result = initial;
+    }
+
     core.info(
       `Review complete: ${result.findings.length} findings (model: ${result.model}, indexed: ${result.indexed})`,
     );
@@ -102,43 +175,35 @@ async function run(): Promise<void> {
 
     // ── Post review ───────────────────────────────────────────────────────
 
-    if (result.findings.length === 0) {
-      // Post a short positive comment
-      const octokit = github.getOctokit(githubToken);
-      let body = result.summary || "No issues found. Looking good!";
-      body += "\n\n---\n*Reviewed by [Octopus](https://octopus-review.ai)*";
+    const summaryBody = buildSummaryBody(result);
 
-      if (result.community && result.firstCommunityReview) {
-        body +=
-          "\n\n---\n*This review ran without an Octopus API key. " +
-          "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
-          "[Learn more](https://octopus-review.ai/docs/github-action)*";
-      }
+    await postOrUpdateSummaryComment({
+      octokit,
+      owner,
+      repo,
+      prNumber,
+      body: summaryBody,
+    }).catch((err) =>
+      core.warning(
+        `Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    );
 
-      await octokit.rest.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNumber,
-        body,
-      });
-
-      core.info("Posted summary comment (no findings).");
-    } else {
+    if (result.findings.length > 0) {
       const { posted, skipped } = await postReview({
         token: githubToken,
         owner,
         repo,
         prNumber,
         findings: result.findings,
-        summary: result.summary,
         diff,
-        community: result.community,
-        firstCommunityReview: result.firstCommunityReview,
       });
 
       core.info(
         `Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`,
       );
+    } else {
+      core.info("No findings — summary comment only.");
     }
 
     // ── Set outputs ───────────────────────────────────────────────────────
@@ -169,6 +234,82 @@ async function run(): Promise<void> {
       core.setFailed(`Unexpected error: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+}
+
+type PollOutcome =
+  | { kind: "completed"; result: ReviewResponseCompleted }
+  | { kind: "failed"; error: string }
+  | { kind: "expired" }
+  | { kind: "timeout" };
+
+async function pollUntilDone(
+  apiUrl: string,
+  jobId: string,
+  repoFullName: string,
+): Promise<PollOutcome> {
+  const start = Date.now();
+  let lastStatus = "";
+
+  while (Date.now() - start < POLL_TIMEOUT_MS) {
+    await sleep(POLL_INTERVAL_MS);
+
+    let polled;
+    try {
+      polled = await pollReview(apiUrl, jobId, repoFullName);
+    } catch (err) {
+      core.warning(
+        `Poll failed (will retry): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
+
+    if (polled.status !== lastStatus) {
+      core.info(`Job ${jobId} status: ${polled.status}`);
+      lastStatus = polled.status;
+    }
+
+    if (polled.status === "completed") {
+      return { kind: "completed", result: polled };
+    }
+    if (polled.status === "failed") {
+      return { kind: "failed", error: polled.error };
+    }
+    if (polled.status === "expired") {
+      return { kind: "expired" };
+    }
+    // indexing | reviewing → keep polling
+  }
+
+  return { kind: "timeout" };
+}
+
+function buildSummaryBody(result: ReviewResponseCompleted): string {
+  const lines: string[] = [];
+
+  if (result.summary && result.summary.trim().length > 0) {
+    lines.push(result.summary);
+  } else {
+    lines.push("No issues found. Looking good!");
+  }
+
+  lines.push("");
+  lines.push("---");
+  lines.push("*Reviewed by [Octopus](https://octopus-review.ai)*");
+
+  if (result.community && result.firstCommunityReview) {
+    lines.push("");
+    lines.push(
+      "*This review ran without an Octopus API key. " +
+        "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
+        "[Learn more](https://octopus-review.ai/docs/github-action)*",
+    );
+  }
+
+  return lines.join("\n");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 run();

@@ -30017,7 +30017,10 @@ const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const octopus_client_1 = __nccwpck_require__(9892);
 const post_review_1 = __nccwpck_require__(2122);
+const summary_comment_1 = __nccwpck_require__(9955);
 const MAX_DIFF_SIZE = 500_000; // 500KB
+const POLL_INTERVAL_MS = 10_000; // 10s
+const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 async function run() {
     try {
         // ── Validate event ────────────────────────────────────────────────────
@@ -30069,7 +30072,7 @@ async function run() {
         }
         // ── Call Octopus API ──────────────────────────────────────────────────
         core.info("Sending to Octopus for review...");
-        const result = await (0, octopus_client_1.requestReview)(apiUrl, apiKey, {
+        const initial = await (0, octopus_client_1.requestReview)(apiUrl, apiKey, {
             owner,
             repo,
             prNumber,
@@ -30082,43 +30085,86 @@ async function run() {
             forceReindex,
             reindexThresholdHours,
         });
+        let result;
+        if (initial.status === "queued") {
+            core.info(`Repository indexing in background (jobId=${initial.jobId}${initial.existing ? ", existing job" : ""}). Polling for result...`);
+            // Show progress in the (single) Octopus summary comment — find-or-create.
+            try {
+                await (0, summary_comment_1.postOrUpdateSummaryComment)({
+                    octokit,
+                    owner,
+                    repo,
+                    prNumber,
+                    body: "> 🐙 **Octopus Review** — Repository hasn't been indexed yet.\n>\n" +
+                        "> Indexing in progress... will update this comment with the review when ready.",
+                });
+            }
+            catch (err) {
+                core.warning(`Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            const repoFullName = `${owner}/${repo}`;
+            const polled = await pollUntilDone(apiUrl, initial.jobId, repoFullName);
+            if (polled.kind === "timeout") {
+                core.warning(`Polling timed out after ${POLL_TIMEOUT_MS / 1000}s — indexing is still running on the server. ` +
+                    `The review will be posted on the next push or workflow run once indexing completes.`);
+                await (0, summary_comment_1.postOrUpdateSummaryComment)({
+                    octokit,
+                    owner,
+                    repo,
+                    prNumber,
+                    body: "> 🐙 **Octopus Review** — Indexing is taking longer than expected.\n>\n" +
+                        "> Re-run this workflow (or push a new commit) once indexing finishes to get the review.",
+                }).catch((err) => core.warning(`Failed to update placeholder: ${err instanceof Error ? err.message : String(err)}`));
+                core.setOutput("findings-count", "0");
+                core.setOutput("summary", "Indexing in progress; review pending.");
+                return;
+            }
+            if (polled.kind === "failed") {
+                core.setFailed(`Octopus review failed: ${polled.error}`);
+                await (0, summary_comment_1.postOrUpdateSummaryComment)({
+                    octokit,
+                    owner,
+                    repo,
+                    prNumber,
+                    body: `> 🐙 **Octopus Review** — Review failed: ${polled.error}`,
+                }).catch(() => { });
+                return;
+            }
+            if (polled.kind === "expired") {
+                core.warning("Octopus review job expired before completion.");
+                return;
+            }
+            result = polled.result;
+        }
+        else {
+            result = initial;
+        }
         core.info(`Review complete: ${result.findings.length} findings (model: ${result.model}, indexed: ${result.indexed})`);
         if (result.community) {
             core.info("Running in community mode. Add octopus-api-key to unlock full features: knowledge base, custom rules, and review history.");
         }
         // ── Post review ───────────────────────────────────────────────────────
-        if (result.findings.length === 0) {
-            // Post a short positive comment
-            const octokit = github.getOctokit(githubToken);
-            let body = result.summary || "No issues found. Looking good!";
-            body += "\n\n---\n*Reviewed by [Octopus](https://octopus-review.ai)*";
-            if (result.community && result.firstCommunityReview) {
-                body +=
-                    "\n\n---\n*This review ran without an Octopus API key. " +
-                        "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
-                        "[Learn more](https://octopus-review.ai/docs/github-action)*";
-            }
-            await octokit.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: prNumber,
-                body,
-            });
-            core.info("Posted summary comment (no findings).");
-        }
-        else {
+        const summaryBody = buildSummaryBody(result);
+        await (0, summary_comment_1.postOrUpdateSummaryComment)({
+            octokit,
+            owner,
+            repo,
+            prNumber,
+            body: summaryBody,
+        }).catch((err) => core.warning(`Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`));
+        if (result.findings.length > 0) {
             const { posted, skipped } = await (0, post_review_1.postReview)({
                 token: githubToken,
                 owner,
                 repo,
                 prNumber,
                 findings: result.findings,
-                summary: result.summary,
                 diff,
-                community: result.community,
-                firstCommunityReview: result.firstCommunityReview,
             });
             core.info(`Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`);
+        }
+        else {
+            core.info("No findings — summary comment only.");
         }
         // ── Set outputs ───────────────────────────────────────────────────────
         core.setOutput("findings-count", String(result.findings.length));
@@ -30148,6 +30194,58 @@ async function run() {
         }
     }
 }
+async function pollUntilDone(apiUrl, jobId, repoFullName) {
+    const start = Date.now();
+    let lastStatus = "";
+    while (Date.now() - start < POLL_TIMEOUT_MS) {
+        await sleep(POLL_INTERVAL_MS);
+        let polled;
+        try {
+            polled = await (0, octopus_client_1.pollReview)(apiUrl, jobId, repoFullName);
+        }
+        catch (err) {
+            core.warning(`Poll failed (will retry): ${err instanceof Error ? err.message : String(err)}`);
+            continue;
+        }
+        if (polled.status !== lastStatus) {
+            core.info(`Job ${jobId} status: ${polled.status}`);
+            lastStatus = polled.status;
+        }
+        if (polled.status === "completed") {
+            return { kind: "completed", result: polled };
+        }
+        if (polled.status === "failed") {
+            return { kind: "failed", error: polled.error };
+        }
+        if (polled.status === "expired") {
+            return { kind: "expired" };
+        }
+        // indexing | reviewing → keep polling
+    }
+    return { kind: "timeout" };
+}
+function buildSummaryBody(result) {
+    const lines = [];
+    if (result.summary && result.summary.trim().length > 0) {
+        lines.push(result.summary);
+    }
+    else {
+        lines.push("No issues found. Looking good!");
+    }
+    lines.push("");
+    lines.push("---");
+    lines.push("*Reviewed by [Octopus](https://octopus-review.ai)*");
+    if (result.community && result.firstCommunityReview) {
+        lines.push("");
+        lines.push("*This review ran without an Octopus API key. " +
+            "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
+            "[Learn more](https://octopus-review.ai/docs/github-action)*");
+    }
+    return lines.join("\n");
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 run();
 
 
@@ -30164,6 +30262,7 @@ run();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.OctopusApiError = void 0;
 exports.requestReview = requestReview;
+exports.pollReview = pollReview;
 async function requestReview(apiUrl, apiKey, params) {
     const headers = {
         "Content-Type": "application/json",
@@ -30176,6 +30275,25 @@ async function requestReview(apiUrl, apiKey, params) {
         headers,
         body: JSON.stringify(params),
     });
+    if (!res.ok) {
+        const body = await res.json().catch(() => ({ error: "Unknown error" }));
+        const message = body.error ?? `HTTP ${res.status}`;
+        throw new OctopusApiError(message, res.status);
+    }
+    return res.json();
+}
+async function pollReview(apiUrl, jobId, repoFullName) {
+    const url = `${apiUrl}/api/github-action/review/${encodeURIComponent(jobId)}?repo=${encodeURIComponent(repoFullName)}`;
+    const res = await fetch(url, { method: "GET" });
+    if (res.status === 404) {
+        throw new OctopusApiError("Job not found", 404);
+    }
+    if (res.status === 403) {
+        throw new OctopusApiError("Repo mismatch on poll", 403);
+    }
+    if (res.status === 410) {
+        return { status: "expired", error: "Job expired" };
+    }
     if (!res.ok) {
         const body = await res.json().catch(() => ({ error: "Unknown error" }));
         const message = body.error ?? `HTTP ${res.status}`;
@@ -30304,15 +30422,10 @@ async function postReview(params) {
     const octokit = github.getOctokit(params.token);
     const diffLines = (0, diff_parser_1.parseDiffLines)(params.diff);
     const comments = buildInlineComments(params.findings, diffLines);
-    // Build review body
-    let reviewBody = params.summary;
-    if (params.community && params.firstCommunityReview) {
-        reviewBody +=
-            "\n\n---\n*This review ran without an Octopus API key. " +
-                "Add `octopus-api-key` to unlock your team's knowledge base, custom rules, and full review history. " +
-                "[Learn more](https://octopus-review.ai/docs/github-action)*";
-    }
-    reviewBody += "\n\n---\n*Reviewed by [Octopus](https://octopus-review.ai)*";
+    // The full summary lives in a separate find-or-update issue comment so it
+    // doesn't accumulate across commits. The review body here is a short pointer.
+    const reviewBody = `🐙 **Octopus** posted ${params.findings.length} inline finding${params.findings.length === 1 ? "" : "s"}. ` +
+        `See the pinned Octopus summary comment for the full review.`;
     // Post the review — retry without offending comments on 422
     let commentsToPost = comments;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -30346,6 +30459,112 @@ async function postReview(params) {
         }
     }
     return { posted: 0, skipped: params.findings.length };
+}
+
+
+/***/ }),
+
+/***/ 9955:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * Find-or-update the single Octopus summary comment on a PR.
+ *
+ * Each PR should have at most one top-level Octopus comment that gets
+ * rewritten as new commits trigger fresh reviews, instead of accumulating
+ * a fresh comment per push. We tag the comment with a hidden HTML marker
+ * so we can locate it reliably on later runs.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SUMMARY_MARKER = void 0;
+exports.postOrUpdateSummaryComment = postOrUpdateSummaryComment;
+const core = __importStar(__nccwpck_require__(7484));
+exports.SUMMARY_MARKER = "<!-- octopus-review-summary-comment -->";
+async function postOrUpdateSummaryComment(params) {
+    const { octokit, owner, repo, prNumber } = params;
+    const taggedBody = `${exports.SUMMARY_MARKER}\n${params.body}`;
+    const existing = await findExistingSummaryComment(octokit, owner, repo, prNumber);
+    if (existing) {
+        await octokit.rest.issues.updateComment({
+            owner,
+            repo,
+            comment_id: existing.id,
+            body: taggedBody,
+        });
+        core.info(`Updated existing Octopus summary comment (id=${existing.id}).`);
+        return { action: "updated", commentId: existing.id };
+    }
+    const created = await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: prNumber,
+        body: taggedBody,
+    });
+    core.info(`Created Octopus summary comment (id=${created.data.id}).`);
+    return { action: "created", commentId: created.data.id };
+}
+async function findExistingSummaryComment(octokit, owner, repo, prNumber) {
+    // Issue comments are paginated (default 30 per page). For most PRs the Octopus
+    // comment will be among the recent ones; iterate just in case the PR has many.
+    const iterator = octokit.paginate.iterator(octokit.rest.issues.listComments, {
+        owner,
+        repo,
+        issue_number: prNumber,
+        per_page: 100,
+    });
+    let fallback = null;
+    for await (const page of iterator) {
+        for (const comment of page.data) {
+            if (!comment.body)
+                continue;
+            if (comment.body.includes(exports.SUMMARY_MARKER)) {
+                return { id: comment.id };
+            }
+            // Backwards-compat: pre-marker comments authored by github-actions[bot]
+            // that contain the Octopus footer. Match the most recent one so older
+            // duplicates do not get reused.
+            if (comment.user?.login === "github-actions[bot]" &&
+                comment.body.includes("Reviewed by [Octopus]")) {
+                fallback = { id: comment.id };
+            }
+        }
+    }
+    return fallback;
 }
 
 
