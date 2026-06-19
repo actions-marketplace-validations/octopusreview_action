@@ -29974,6 +29974,109 @@ function parseDiffLines(diff) {
 
 /***/ }),
 
+/***/ 3916:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * Helpers for surfacing GitHub token permission problems with actionable guidance.
+ *
+ * The most common failure for the community/open-source setup: a pull request
+ * opened from a fork. GitHub downgrades GITHUB_TOKEN to read-only for fork PRs
+ * on the `pull_request` event, so Octopus cannot post its review. Instead of a
+ * generic "it does not work" failure, we detect this case and tell the user
+ * exactly how to fix it.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.isPermissionError = isPermissionError;
+exports.resetWarningsForTests = resetWarningsForTests;
+exports.warnReadOnlyToken = warnReadOnlyToken;
+const core = __importStar(__nccwpck_require__(7484));
+const DOCS_URL = "https://octopus-review.ai/docs/github-action#fork-pull-requests";
+/**
+ * True when an Octokit error indicates the token lacks write access — typically
+ * a read-only GITHUB_TOKEN on a fork PR.
+ */
+function isPermissionError(err) {
+    const e = err;
+    if (!e)
+        return false;
+    const message = typeof e.message === "string" ? e.message : "";
+    // Rate limiting and abuse detection also surface as 403, but switching to
+    // pull_request_target would not help there — don't misclassify them.
+    if (/rate limit|secondary rate|abuse detection/i.test(message))
+        return false;
+    if (message.includes("Resource not accessible by integration"))
+        return true;
+    return e.status === 403;
+}
+let alreadyWarned = false;
+/**
+ * Test-only: reset the de-duplication flag so each test run starts clean.
+ * The flag is module-level, which is correct for a single Action invocation
+ * but would otherwise persist across tests that import this module once.
+ */
+function resetWarningsForTests() {
+    alreadyWarned = false;
+}
+/**
+ * Emit a single, clear, actionable warning explaining why Octopus could not
+ * post and how to enable it. De-duplicated so it shows once per run even if
+ * both the summary comment and the inline review hit the same error.
+ */
+function warnReadOnlyToken(eventName) {
+    if (alreadyWarned)
+        return;
+    alreadyWarned = true;
+    core.warning("Octopus could not post its review because the GITHUB_TOKEN is read-only. " +
+        "GitHub restricts GITHUB_TOKEN to read-only on pull requests from forks when " +
+        "using the `pull_request` event, so review comments cannot be created.\n\n" +
+        "To enable reviews on fork pull requests, choose one of:\n" +
+        "  1. Switch the workflow trigger to `pull_request_target`. The Octopus action " +
+        "only reads the PR diff via the API; it never checks out or runs PR code, so " +
+        "this is safe as long as your workflow does not check out and build the fork's head.\n" +
+        "  2. Install the Octopus GitHub App, which posts reviews with its own " +
+        "installation permissions and is unaffected by fork token restrictions.\n\n" +
+        `See ${DOCS_URL} (current event: ${eventName}).`);
+}
+
+
+/***/ }),
+
 /***/ 9407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -30018,6 +30121,7 @@ const github = __importStar(__nccwpck_require__(3228));
 const octopus_client_1 = __nccwpck_require__(9892);
 const post_review_1 = __nccwpck_require__(2122);
 const summary_comment_1 = __nccwpck_require__(9955);
+const errors_1 = __nccwpck_require__(3916);
 const MAX_DIFF_SIZE = 500_000; // 500KB
 const POLL_INTERVAL_MS = 10_000; // 10s
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
@@ -30049,6 +30153,17 @@ async function run() {
         core.info(`Reviewing PR #${prNumber}: ${prTitle}`);
         if (!apiKey) {
             core.info("No octopus-api-key provided. Running in community mode (public repos only).");
+        }
+        // Heads-up for the common fork-PR pitfall: on the `pull_request` event GitHub
+        // makes GITHUB_TOKEN read-only for forks, so posting will fail later. We warn
+        // upfront so the cause is obvious even before the post attempt.
+        const headRepoFullName = pr.head?.repo?.full_name || "";
+        const isForkPr = headRepoFullName !== "" && headRepoFullName !== `${owner}/${repo}`;
+        if (isForkPr && eventName === "pull_request") {
+            core.info("This pull request comes from a fork. GITHUB_TOKEN is read-only for fork PRs " +
+                "on the `pull_request` event, so Octopus may be unable to post its review. " +
+                "If comments do not appear, see " +
+                "https://octopus-review.ai/docs/github-action#fork-pull-requests");
         }
         // ── Fetch PR diff ─────────────────────────────────────────────────────
         const octokit = github.getOctokit(githubToken);
@@ -30100,7 +30215,12 @@ async function run() {
                 });
             }
             catch (err) {
-                core.warning(`Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`);
+                if ((0, errors_1.isPermissionError)(err)) {
+                    (0, errors_1.warnReadOnlyToken)(eventName);
+                }
+                else {
+                    core.warning(`Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`);
+                }
             }
             const repoFullName = `${owner}/${repo}`;
             const polled = await pollUntilDone(apiUrl, initial.jobId, repoFullName);
@@ -30151,17 +30271,34 @@ async function run() {
             repo,
             prNumber,
             body: summaryBody,
-        }).catch((err) => core.warning(`Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`));
+        }).catch((err) => {
+            if ((0, errors_1.isPermissionError)(err)) {
+                (0, errors_1.warnReadOnlyToken)(eventName);
+            }
+            else {
+                core.warning(`Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        });
         if (result.findings.length > 0) {
-            const { posted, skipped } = await (0, post_review_1.postReview)({
-                token: githubToken,
-                owner,
-                repo,
-                prNumber,
-                findings: result.findings,
-                diff,
-            });
-            core.info(`Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`);
+            try {
+                const { posted, skipped } = await (0, post_review_1.postReview)({
+                    token: githubToken,
+                    owner,
+                    repo,
+                    prNumber,
+                    findings: result.findings,
+                    diff,
+                });
+                core.info(`Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`);
+            }
+            catch (err) {
+                if ((0, errors_1.isPermissionError)(err)) {
+                    (0, errors_1.warnReadOnlyToken)(eventName);
+                }
+                else {
+                    throw err;
+                }
+            }
         }
         else {
             core.info("No findings — summary comment only.");

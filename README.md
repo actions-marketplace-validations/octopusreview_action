@@ -108,6 +108,34 @@ The action needs these GitHub token permissions:
 
 For **private repos**, the `GITHUB_TOKEN` (automatically provided) already has access to the repository it runs in. The token is passed to Octopus for indexing only, is never stored, and expires when the workflow ends.
 
+## Fork pull requests
+
+GitHub makes `GITHUB_TOKEN` read-only for pull requests opened from forks when using the `pull_request` event. This is a deliberate security measure against untrusted forks, and it means Octopus cannot post its review on those PRs (reviews on branches within the same repository are unaffected).
+
+To enable reviews on fork pull requests, switch the trigger to `pull_request_target`:
+
+```yaml
+# .github/workflows/octopus.yml
+name: Octopus Review
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: octopusreview/action@v1
+```
+
+The Octopus action only reads the PR diff through the GitHub API; it never checks out or runs the fork's code, so `pull_request_target` is safe here, as long as your workflow does not add a checkout step that builds the fork head.
+
+For larger repositories that prefer not to grant a writable token in CI at all, install the [Octopus GitHub App](https://octopus-review.ai/open-source) instead. The App posts reviews with its own installation permissions, so fork token restrictions never apply.
+
 ## Examples
 
 ### Only review on specific paths
@@ -141,6 +169,9 @@ No. Your code is used temporarily for indexing (creating vector embeddings) and 
 
 **How does the community tier work?**
 Public repositories can use Octopus for free with no signup. A community organization is automatically created per GitHub owner (user or org). The daily review limit is 5 reviews per repository.
+
+**Why are reviews not posted on pull requests from forks?**
+GitHub makes `GITHUB_TOKEN` read-only for fork pull requests on the `pull_request` event, so the action cannot create review comments. Switch the trigger to `pull_request_target`, or install the Octopus GitHub App. See [Fork pull requests](#fork-pull-requests) above.
 
 **What models does Octopus use?**
 Octopus uses Claude (Anthropic) for code review and OpenAI for embeddings by default. Organizations with API keys can configure custom models.
