@@ -19,14 +19,24 @@ const DOCS_URL = "https://octopus-review.ai/docs/github-action#fork-pull-request
 export function isPermissionError(err: unknown): boolean {
   const e = err as { status?: number; message?: string } | null | undefined;
   if (!e) return false;
-  if (e.status === 403) return true;
-  return (
-    typeof e.message === "string" &&
-    e.message.includes("Resource not accessible by integration")
-  );
+  const message = typeof e.message === "string" ? e.message : "";
+  // Rate limiting and abuse detection also surface as 403, but switching to
+  // pull_request_target would not help there — don't misclassify them.
+  if (/rate limit|secondary rate|abuse detection/i.test(message)) return false;
+  if (message.includes("Resource not accessible by integration")) return true;
+  return e.status === 403;
 }
 
 let alreadyWarned = false;
+
+/**
+ * Test-only: reset the de-duplication flag so each test run starts clean.
+ * The flag is module-level, which is correct for a single Action invocation
+ * but would otherwise persist across tests that import this module once.
+ */
+export function resetWarningsForTests(): void {
+  alreadyWarned = false;
+}
 
 /**
  * Emit a single, clear, actionable warning explaining why Octopus could not

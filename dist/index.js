@@ -30023,6 +30023,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.isPermissionError = isPermissionError;
+exports.resetWarningsForTests = resetWarningsForTests;
 exports.warnReadOnlyToken = warnReadOnlyToken;
 const core = __importStar(__nccwpck_require__(7484));
 const DOCS_URL = "https://octopus-review.ai/docs/github-action#fork-pull-requests";
@@ -30034,12 +30035,24 @@ function isPermissionError(err) {
     const e = err;
     if (!e)
         return false;
-    if (e.status === 403)
+    const message = typeof e.message === "string" ? e.message : "";
+    // Rate limiting and abuse detection also surface as 403, but switching to
+    // pull_request_target would not help there — don't misclassify them.
+    if (/rate limit|secondary rate|abuse detection/i.test(message))
+        return false;
+    if (message.includes("Resource not accessible by integration"))
         return true;
-    return (typeof e.message === "string" &&
-        e.message.includes("Resource not accessible by integration"));
+    return e.status === 403;
 }
 let alreadyWarned = false;
+/**
+ * Test-only: reset the de-duplication flag so each test run starts clean.
+ * The flag is module-level, which is correct for a single Action invocation
+ * but would otherwise persist across tests that import this module once.
+ */
+function resetWarningsForTests() {
+    alreadyWarned = false;
+}
 /**
  * Emit a single, clear, actionable warning explaining why Octopus could not
  * post and how to enable it. De-duplicated so it shows once per run even if
