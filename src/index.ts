@@ -3,6 +3,7 @@ import * as github from "@actions/github";
 import { requestReview, pollReview, OctopusApiError, type ReviewResponseCompleted } from "./octopus-client";
 import { postReview } from "./post-review";
 import { postOrUpdateSummaryComment } from "./summary-comment";
+import { isPermissionError, warnReadOnlyToken } from "./errors";
 
 const MAX_DIFF_SIZE = 500_000; // 500KB
 const POLL_INTERVAL_MS = 10_000; // 10s
@@ -47,6 +48,20 @@ async function run(): Promise<void> {
     core.info(`Reviewing PR #${prNumber}: ${prTitle}`);
     if (!apiKey) {
       core.info("No octopus-api-key provided. Running in community mode (public repos only).");
+    }
+
+    // Heads-up for the common fork-PR pitfall: on the `pull_request` event GitHub
+    // makes GITHUB_TOKEN read-only for forks, so posting will fail later. We warn
+    // upfront so the cause is obvious even before the post attempt.
+    const headRepoFullName = (pr.head?.repo?.full_name as string) || "";
+    const isForkPr = headRepoFullName !== "" && headRepoFullName !== `${owner}/${repo}`;
+    if (isForkPr && eventName === "pull_request") {
+      core.info(
+        "This pull request comes from a fork. GITHUB_TOKEN is read-only for fork PRs " +
+          "on the `pull_request` event, so Octopus may be unable to post its review. " +
+          "If comments do not appear, see " +
+          "https://octopus-review.ai/docs/github-action#fork-pull-requests",
+      );
     }
 
     // ── Fetch PR diff ─────────────────────────────────────────────────────
@@ -112,9 +127,13 @@ async function run(): Promise<void> {
             "> Indexing in progress... will update this comment with the review when ready.",
         });
       } catch (err) {
-        core.warning(
-          `Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        if (isPermissionError(err)) {
+          warnReadOnlyToken(eventName);
+        } else {
+          core.warning(
+            `Failed to post placeholder comment: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
 
       const repoFullName = `${owner}/${repo}`;
@@ -183,25 +202,37 @@ async function run(): Promise<void> {
       repo,
       prNumber,
       body: summaryBody,
-    }).catch((err) =>
-      core.warning(
-        `Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`,
-      ),
-    );
+    }).catch((err) => {
+      if (isPermissionError(err)) {
+        warnReadOnlyToken(eventName);
+      } else {
+        core.warning(
+          `Failed to post Octopus summary comment: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
 
     if (result.findings.length > 0) {
-      const { posted, skipped } = await postReview({
-        token: githubToken,
-        owner,
-        repo,
-        prNumber,
-        findings: result.findings,
-        diff,
-      });
+      try {
+        const { posted, skipped } = await postReview({
+          token: githubToken,
+          owner,
+          repo,
+          prNumber,
+          findings: result.findings,
+          diff,
+        });
 
-      core.info(
-        `Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`,
-      );
+        core.info(
+          `Posted review: ${posted} inline comments, ${skipped} could not be mapped to diff lines.`,
+        );
+      } catch (err) {
+        if (isPermissionError(err)) {
+          warnReadOnlyToken(eventName);
+        } else {
+          throw err;
+        }
+      }
     } else {
       core.info("No findings — summary comment only.");
     }
